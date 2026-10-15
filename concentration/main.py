@@ -19,10 +19,14 @@ from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassif
 from sklearn.model_selection import GroupKFold, LeaveOneGroupOut
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score
 from sklearn.feature_selection import RFECV
+from sklearn.base import clone
+
 import joblib
+from joblib import Parallel, delayed
 from pyriemann.classification import MDM
 from pyriemann.classification import FgMDM
 from mne.decoding import CSP
+
 
 import torch
 
@@ -30,55 +34,58 @@ from braindecode.models import EEGNet
 from braindecode.classifier import EEGClassifier
 
 from skorch.callbacks import EarlyStopping
-
+import logging
+import warnings
+warnings.filterwarnings("ignore")
+logging.getLogger("mne").setLevel(logging.ERROR)
+logging.getLogger("pyriemann").setLevel(logging.ERROR)
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 os.environ["LOKY_MAX_CPU_COUNT"] = str(2)
-
 mne.set_log_level("ERROR")
 def get_tree_models() -> dict:
     return {
-        "Random Forest": RandomForestClassifier(n_estimators=100, max_depth=12, class_weight="balanced", random_state=42, n_jobs=2),
+        "Random Forest": RandomForestClassifier(n_estimators=100, max_depth=12, class_weight="balanced", random_state=42, n_jobs=1),
         "HistGradient": HistGradientBoostingClassifier(max_iter=100, class_weight="balanced", random_state=42),
-        "XGBoost": XGBClassifier(n_estimators=100, max_depth=6, learning_rate=0.1, random_state=42, eval_metric="logloss", n_jobs=2)
+        "XGBoost": XGBClassifier(n_estimators=100, max_depth=6, learning_rate=0.1, random_state=42, eval_metric="logloss", n_jobs=1)
     }
 
 def get_riemann_models():
 
     return {
 
-        # "MDM":
-        # make_pipeline(
-        #     Covariances(estimator="oas"),
-        #     MDM(metric="riemann")
-        # ),
+        "MDM":
+        make_pipeline(
+            Covariances(estimator="oas"),
+            MDM(metric="riemann")
+        ),
 
-        # "FgMDM":
-        # make_pipeline(
-        #     Covariances(estimator="oas"),
-        #     FgMDM(metric="riemann")
-        # ),
+        "FgMDM":
+        make_pipeline(
+            Covariances(estimator="oas"),
+            FgMDM(metric="riemann")
+        ),
 
-        # "Riemann + LogReg":
-        # make_pipeline(
-        #     Covariances(estimator='oas'),
-        #     TangentSpace(metric='riemann'),
-        #     LogisticRegression(
-        #         class_weight="balanced",
-        #         max_iter=1000,
-        #         random_state=42
-        #     )
-        # ),
+        "Riemann + LogReg":
+        make_pipeline(
+            Covariances(estimator='oas'),
+            TangentSpace(metric='riemann'),
+            LogisticRegression(
+                class_weight="balanced",
+                max_iter=1000,
+                random_state=42
+            )
+        ),
 
-        # "Riemann + LinSVM":
-        # make_pipeline(
-        #     Covariances(estimator='oas'),
-        #     TangentSpace(metric='riemann'),
-        #     SVC(
-        #         kernel='linear',
-        #         class_weight="balanced",
-        #         random_state=42
-        #     )
-        # ),
+        "Riemann + LinSVM":
+        make_pipeline(
+            Covariances(estimator='oas'),
+            TangentSpace(metric='riemann'),
+            SVC(
+                kernel='linear',
+                class_weight="balanced",
+                random_state=42
+            )
+        ),
         "Riemann + RBF-SVM":
         make_pipeline(
             Covariances(estimator='oas'),
@@ -129,12 +136,12 @@ def get_csp_models():
                 n_components=6,
                 reg='oas',
                 log=True,
-                norm_trace=False,
+                norm_trace=False
             ),
             SVC(
                 kernel='linear',
                 class_weight='balanced',
-                random_state=42
+                random_state=42,
             )
         ),
 
@@ -144,12 +151,12 @@ def get_csp_models():
                 n_components=6,
                 reg='oas',
                 log=True,
-                norm_trace=False,
+                norm_trace=False
             ),
             LogisticRegression(
                 class_weight='balanced',
                 max_iter=2000,
-                random_state=42
+                random_state=42,
             )
         )
     }
@@ -160,7 +167,7 @@ def get_eegnet():
 
         module=EEGNet,
 
-        module__n_chans=9,
+        module__n_chans=11,
         module__n_outputs=2,
         module__n_times=1000,
 
@@ -180,37 +187,68 @@ def get_eegnet():
     )
 
 def get_feature_names(ch_names):
-    bands = ['Delta', 'Theta', 'Alpha', 'Beta', 'Gamma']
+    bands = ['Delta', 'Theta', 'Alpha_low', 'Alpha_high', 'Beta_low', 'Beta_high', 'Gamma']
     names = []
     for band in bands:
-        names.extend([f"{ch} {band} (Power)" for ch in ch_names])
-        names.extend([f"{ch} {band} (Log)" for ch in ch_names])
-    for band in bands:
+        # names.extend([f"{ch} {band} (Power)" for ch in ch_names])
+        # names.extend([f"{ch} {band} (Log)" for ch in ch_names])
         names.extend([
             f"{ch} Rel {band}"
             for ch in ch_names
         ])
-    names.extend([f"{ch} Theta/Beta Ratio" for ch in ch_names])
-    names.extend([f"{ch} Alpha/Beta Ratio" for ch in ch_names])
     names.extend([
-    f"{ch} Hjorth Activity"
+        f"{ch} Theta/BetaLow"
         for ch in ch_names
     ])
 
     names.extend([
-        f"{ch} Hjorth Mobility"
+        f"{ch} Theta/BetaHigh"
         for ch in ch_names
     ])
 
     names.extend([
-        f"{ch} Hjorth Complexity"
+        f"{ch} AlphaLow/BetaLow"
         for ch in ch_names
     ])
 
     names.extend([
-        "F4-F3 Alpha Asymmetry",
-        "C4-C3 Alpha Asymmetry",
-        "P4-P3 Alpha Asymmetry",
+        f"{ch} AlphaLow/BetaHigh"
+        for ch in ch_names
+    ])
+
+    names.extend([
+        f"{ch} AlphaHigh/BetaLow"
+        for ch in ch_names
+    ])
+
+    names.extend([
+        f"{ch} AlphaHigh/BetaHigh"
+        for ch in ch_names
+    ])
+    names.extend([
+        f"{ch} EI"
+        for ch in ch_names
+    ])
+    # names.extend([
+    # f"{ch} Hjorth Activity"
+    #     for ch in ch_names
+    # ])
+
+    # names.extend([
+    #     f"{ch} Hjorth Mobility"
+    #     for ch in ch_names
+    # ])
+
+    # names.extend([
+    #     f"{ch} Hjorth Complexity"
+    #     for ch in ch_names
+    # ])
+
+    names.extend([
+        "F4-F3 Alpha Low Asymmetry",
+        "F4-F3 Alpha High Asymmetry",
+        "FP2-FP1 Alpha Low Asymmetry",
+        "FP2-FP1 Alpha High Asymmetry"
     ])
     return np.array(names)
 
@@ -220,7 +258,19 @@ def extract_features_original(epoch_data: np.ndarray, sfreq: float, ch_names: li
     n_channels = epoch_data.shape[0]
     nperseg = min(epoch_data.shape[1], int(sfreq * 2))
     freqs, psd = welch(epoch_data, fs=sfreq, nperseg=nperseg, axis=-1)
-    bands = {'delta': (0.5, 4.0), 'theta': (4.0, 8.0), 'alpha': (8.0, 13.0), 'beta':  (13.0, 30.0), 'gamma': (30.0, 45.0)}
+    bands = {
+        'delta': (0.5, 4.0),
+
+        'theta': (4.0, 8.0),
+
+        'alpha_low': (8.0, 10.0),
+        'alpha_high': (10.0, 13.0),
+
+        'beta_low': (13.0, 20.0),
+        'beta_high': (20.0, 30.0),
+
+        'gamma': (30.0, 45.0)
+    }
     features = []
     band_powers = {}
     
@@ -228,13 +278,15 @@ def extract_features_original(epoch_data: np.ndarray, sfreq: float, ch_names: li
         mask = (freqs >= f_min) & (freqs <= f_max)
         p_band = np.trapezoid(psd[:, mask], freqs[mask], axis=-1) if np.any(mask) else np.zeros(n_channels)
         band_powers[name] = p_band
-        features.extend(p_band)
-        features.extend(0.5 * np.log2(2 * np.pi * np.e * (p_band + 1e-12)))
+        # features.extend(p_band)
+        # features.extend(0.5 * np.log2(2 * np.pi * np.e * (p_band + 1e-12)))
     total_power = (
         band_powers['delta'] +
         band_powers['theta'] +
-        band_powers['alpha'] +
-        band_powers['beta'] +
+        band_powers['alpha_low'] +
+        band_powers['alpha_high'] +
+        band_powers['beta_low'] +
+        band_powers['beta_high'] +
         band_powers['gamma'] +
         1e-12
     )
@@ -242,28 +294,36 @@ def extract_features_original(epoch_data: np.ndarray, sfreq: float, ch_names: li
 
     features.extend(band_powers['theta'] / total_power)
 
-    features.extend(band_powers['alpha'] / total_power)
+    features.extend(band_powers['alpha_low'] / total_power)
+    features.extend(band_powers['alpha_high'] / total_power)
 
-    features.extend(band_powers['beta'] / total_power)
+    features.extend(band_powers['beta_low'] / total_power)
+    features.extend(band_powers['beta_high'] / total_power)
 
     features.extend(band_powers['gamma'] / total_power)
 
-    features.extend(band_powers['theta'] / (band_powers['beta'] + 1e-12))
-    features.extend(band_powers['alpha'] / (band_powers['beta'] + 1e-12))
 
-    for ch in range(epoch_data.shape[0]):
-        activity, mobility, complexity = hjorth_parameters(epoch_data[ch])
+    features.extend(band_powers['theta'] / (band_powers['beta_low'] + 1e-12))
+    features.extend(band_powers['theta'] / (band_powers['beta_high'] + 1e-12))
+    features.extend(band_powers['alpha_low'] / (band_powers['beta_low'] + 1e-12))
+    features.extend(band_powers['alpha_low'] / (band_powers['beta_high'] + 1e-12))
+    features.extend(band_powers['alpha_high'] / (band_powers['beta_low'] + 1e-12))
+    features.extend(band_powers['alpha_high'] / (band_powers['beta_high'] + 1e-12))
 
-        features.extend([
-            activity,
-            mobility,
-            complexity
-        ])
+    features.extend((band_powers['beta_high'] + band_powers['beta_low']) / (band_powers['theta'] + band_powers['alpha_low'] + band_powers['alpha_high'] + 1e-12))
+
+    # for ch in range(epoch_data.shape[0]):
+    #     activity, mobility, complexity = hjorth_parameters(epoch_data[ch])
+
+    #     features.extend([
+    #         activity,
+    #         mobility,
+    #         complexity
+    #     ])
 
     pairs = [
         ("F3", "F4"),
-        ("C3", "C4"),
-        ("P3", "P4"),
+        ("FP1", "FP2"),
     ]
     channel_map = {
         name: idx
@@ -274,8 +334,10 @@ def extract_features_original(epoch_data: np.ndarray, sfreq: float, ch_names: li
         l = channel_map[left]
         r = channel_map[right]
 
-        asym = np.log(band_powers["alpha"][r] + 1e-12) - np.log(band_powers["alpha"][l] + 1e-12)
-        features.append(asym)
+        asym_low = np.log(band_powers['alpha_low'][r] + 1e-12) - np.log(band_powers['alpha_low'][l] + 1e-12)
+        asym_high = np.log(band_powers['alpha_high'][r] + 1e-12) - np.log(band_powers['alpha_high'][l] + 1e-12)
+        features.append(asym_low)
+        features.append(asym_high)
 
     
     return np.array(features)
@@ -341,7 +403,7 @@ def load_eegmat_epochs(data_dir: str, target_channels: list = None):
     files = sorted(glob.glob(os.path.join(data_dir, "**", "Subject*_*.edf"), recursive=True))
     if not files:
         files = sorted(glob.glob(os.path.join(data_dir, "Subject*_*.edf")))
-    map_ch = {'T3': 'T7', 'T4': 'T8', 'T5': 'P7', 'T6': 'P8'}
+    map_ch = {'T3': 'T7', 'T4': 'T8', 'T5': 'P7', 'T6': 'P8', 'Fp1': 'FP1', 'Fp2': 'FP2'}
     X_list, y_list, g_list = [], [], []
     ch_names_out, sfreq_out = None, 160.0
     
@@ -355,16 +417,7 @@ def load_eegmat_epochs(data_dir: str, target_channels: list = None):
         except ValueError: continue
         y_val = 0 if cond == 1 else 1
         raw = mne.io.read_raw_edf(path, preload=True, verbose=False)
-        raw.filter(
-            l_freq=1.0,
-            h_freq=45.0,
-            verbose=False
-        )
 
-        raw.set_eeg_reference(
-            "average",
-            verbose=False
-        )
         raw.rename_channels({ch: map_ch.get(ch.replace('EEG ', '').replace('-REF', '').strip(), ch.replace('EEG ', '').replace('-REF', '').strip()) for ch in raw.ch_names})
 
         if target_channels:
@@ -395,6 +448,66 @@ def load_eegmat_epochs(data_dir: str, target_channels: list = None):
     print(f"Loaded {len(X_list)} epochs.")
     return np.array(X_list), np.array(y_list), np.array(g_list), sfreq_out, ch_names_out
 
+def process_fold(
+    train_idx,
+    test_idx,
+    X,
+    y,
+    groups,
+    model,
+    rfecv_estimator=None
+):
+    Xt = X[train_idx]
+    Xte = X[test_idx]
+
+    yt = y[train_idx]
+    yte = y[test_idx]
+
+    train_groups = groups[train_idx]
+
+    feature_count = None
+    support = None
+
+    if rfecv_estimator is not None:
+
+        inner_splits = min(
+            5,
+            len(np.unique(train_groups))
+        )
+
+        rfecv = RFECV(
+            estimator=rfecv_estimator,
+            step=5,
+            cv=GroupKFold(n_splits=inner_splits),
+            scoring='balanced_accuracy',
+            min_features_to_select=5,
+            n_jobs=1   # WAŻNE
+        )
+
+        rfecv.fit(
+            Xt,
+            yt,
+            groups=train_groups
+        )
+
+        Xt = rfecv.transform(Xt)
+        Xte = rfecv.transform(Xte)
+
+        feature_count = rfecv.n_features_
+        support = rfecv.support_
+
+    local_model = clone(model)
+
+    local_model.fit(Xt, yt)
+
+    pred = local_model.predict(Xte)
+
+    return (
+        yte,
+        pred,
+        feature_count,
+        support
+    )
 
 def evaluate_loso(X, y, groups, model_dict, desc, rfecv_estimator=None):
     loso = LeaveOneGroupOut()
@@ -407,90 +520,50 @@ def evaluate_loso(X, y, groups, model_dict, desc, rfecv_estimator=None):
         y_pred = []
         feature_counts = []
 
-        n_splits = loso.get_n_splits(X, y, groups)
         supports = []
-        for fold, (train_idx, test_idx) in enumerate(
-            loso.split(X, y, groups)
-        ):
 
-            print(
-                f"  Evaluating {name}: Subject {fold+1}/{n_splits}...",
-                end="\r"
+        results = Parallel(
+            n_jobs=5,
+            verbose=0
+        )(
+            delayed(process_fold)(
+                train_idx,
+                test_idx,
+                X,
+                y,
+                groups,
+                model,
+                rfecv_estimator
             )
+            for train_idx, test_idx in
+            loso.split(X, y, groups)
+        )
 
-            Xt = X[train_idx]
-            Xte = X[test_idx]
-            if "EEGNet" in name:
+        y_true = []
+        y_pred = []
 
-                mean = np.mean(
-                    Xt,
-                    axis=(0, 2),
-                    keepdims=True
-                )
+        feature_counts = []
+        supports = []
 
-                std = np.std(
-                    Xt,
-                    axis=(0, 2),
-                    keepdims=True
-                ) + 1e-12
-
-                Xt = (Xt - mean) / std
-                Xte = (Xte - mean) / std
-
-                Xt = Xt.astype(np.float32)
-                Xte = Xte.astype(np.float32)
-            yt = y[train_idx]
-            yte = y[test_idx]
-
-            train_groups = groups[train_idx]
-
-            if len(np.unique(yt)) < 2:
-                continue
-
-            if rfecv_estimator is not None:
-
-                inner_splits = min(
-                    5,
-                    len(np.unique(train_groups))
-                )
-
-                rfecv = RFECV(
-                    estimator=rfecv_estimator,
-                    step=5,
-                    cv=GroupKFold(n_splits=inner_splits),
-                    scoring='balanced_accuracy',
-                    min_features_to_select=5,
-                    n_jobs=2
-                )
-
-                rfecv.fit(
-                    Xt,
-                    yt,
-                    groups=train_groups
-                )
-
-                Xt = rfecv.transform(Xt)
-                Xte = rfecv.transform(Xte)
-
-                feature_counts.append(
-                    rfecv.n_features_
-                )
-                supports.append(rfecv.support_)
-            print("Xt:", Xt.shape)
-            print("yt:", yt.shape)
-            print("classes:", np.unique(yt))
-            try:
-                model.fit(Xt, yt)
-
-            except Exception as e:
-                print(e)
-                raise
-
-            pred = model.predict(Xte)
+        for (
+            yte,
+            pred,
+            feature_count,
+            support
+        ) in results:
 
             y_true.extend(yte)
             y_pred.extend(pred)
 
+            if feature_count is not None:
+                feature_counts.append(
+                    feature_count
+                )
+
+            if support is not None:
+                supports.append(
+                    support
+                )
         print(" " * 80, end="\r")
 
         if len(y_true) > 0:
@@ -513,6 +586,20 @@ def evaluate_loso(X, y, groups, model_dict, desc, rfecv_estimator=None):
             freq = np.mean(
                 np.vstack(supports),
                 axis=0
+            )
+            names = get_feature_names(ch_names)
+
+            stable_idx = np.where(freq >= 0.8)[0]
+            joblib.dump(
+                stable_idx,
+                "stable_features.joblib"
+            )
+            print("\nStable features:")
+
+            for idx in stable_idx:
+                print(
+                    f"{freq[idx]:.2f}",
+                    names[idx]
             )
             print(
                 f"{'':<20} | Stable (>80%): "
@@ -541,11 +628,12 @@ def optimize_histgradient(trial, X, y, groups):
 
 if __name__ == "__main__":
     eegmat_dir = "data/eegmat"
+    mne.set_log_level("ERROR")
     
     target_channels = [
-        'F3', 'F4', 'Fz',
-        'C3', 'C4', 'Cz',
-        'P3', 'P4', 'Pz'
+        'F3', 'F4', 
+        # 'Fz', 'Cz', 'Pz',
+        'FP1','FP2'
     ]
    
     X_epochs, y, groups, sfreq, ch_names = load_eegmat_epochs(eegmat_dir, target_channels=target_channels)
@@ -555,8 +643,8 @@ if __name__ == "__main__":
     RUN_ML = False
     RUN_RIEMANN = False
     RUN_CSP = False
-    RUN_FINAL_TRAINING = False
-    RUN_EEGNET = True
+    RUN_FINAL_TRAINING = True
+    RUN_EEGNET = False
     
     X_features_orig = np.array([
         extract_features_original(epoch, sfreq, ch_names)
@@ -569,7 +657,7 @@ if __name__ == "__main__":
     assert X_features_orig.shape[1] == len(get_feature_names(ch_names))
 
     norm_datasets = {
-        "RAW (No Norm)": {"data": X_features_orig},
+        # "RAW (No Norm)": {"data": X_features_orig},
         "STRICT BASELINE (Theoretically Perfect)": {"data": normalize_baseline_strict(X_features_orig, y, groups)}
     }
 
@@ -591,12 +679,7 @@ if __name__ == "__main__":
             class_weight='balanced',
             random_state=42
         ),
-        "poly_SVM": SVC(
-            kernel='poly',
-            degree=3,
-            class_weight='balanced',
-            random_state=42
-        ),
+
 
         "HistGradient": HistGradientBoostingClassifier(
             max_iter=100,
@@ -604,14 +687,6 @@ if __name__ == "__main__":
             random_state=42
         ),
 
-        "XGBoost": XGBClassifier(
-            n_estimators=100,
-            max_depth=6,
-            learning_rate=0.1,
-            random_state=42,
-            eval_metric="logloss",
-            n_jobs=2
-        )
     }
     xgb_rfecv = XGBClassifier(
         n_estimators=100,
@@ -673,12 +748,16 @@ if __name__ == "__main__":
         X_target_norm = norm_datasets["STRICT BASELINE (Theoretically Perfect)"]["data"]
 
         rfecv_tune = RFECV(
-            estimator=xgb_rfecv,
+            estimator=LogisticRegression(
+                max_iter=3000,
+                class_weight='balanced',
+                random_state=42
+            ),
             step=5,
             cv=gkf,
             scoring='balanced_accuracy',
             min_features_to_select=5,
-            n_jobs=2
+            n_jobs=5
         )
 
         rfecv_tune.fit(
@@ -688,7 +767,7 @@ if __name__ == "__main__":
         )
 
         X_tune_optimal = X_target_norm[:, rfecv_tune.support_]
-
+        
         study = optuna.create_study(direction="maximize")
 
         study.optimize(
@@ -704,11 +783,11 @@ if __name__ == "__main__":
 
         print(f"\nFound Best Parameters: {study.best_params}")
 
-        final_prod_model = HistGradientBoostingClassifier(
-            **study.best_params,
-            class_weight='balanced',
-            random_state=42
-        )
+        final_prod_model = SVCLogisticRegression(
+                max_iter=3000,
+                class_weight='balanced',
+                random_state=42
+            ),
 
         final_prod_model.fit(
             X_tune_optimal,

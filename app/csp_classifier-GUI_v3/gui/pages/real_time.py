@@ -7,7 +7,7 @@ import math
 from threading import Thread
 from collections import deque
 
-from PySide6.QtWidgets import QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout, QFileDialog, QScrollArea, QCheckBox, QSpinBox
+from PySide6.QtWidgets import QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout, QFileDialog, QScrollArea, QCheckBox, QSpinBox, QDoubleSpinBox
 from PySide6.QtCore import Qt, Signal, QObject
 
 import mne
@@ -184,6 +184,11 @@ class RealTime(QScrollArea):
         mock_test_row.addStretch()
         self.layout.addLayout(mock_test_row)
 
+        self.engagement_buffer = []
+
+        self.ei_mean = None
+        self.ei_std = None
+
         self.start_acquisition_button = QPushButton("Start Real Time Experiment")
         self.start_acquisition_button.clicked.connect(self.start_or_stop_acquisition)
         self.start_acquisition_button.setEnabled(False)
@@ -205,6 +210,72 @@ class RealTime(QScrollArea):
         self.layout.addWidget(self.plot_container)
         self.init_probability_plot()
 
+        self.use_EEGMAT_preprocessing_checkbox = QCheckBox(
+            "Apply EEGMAT preprocessing"
+        )
+        self.use_engagement_index_checkbox = QCheckBox(
+            "Use Engagement Index instead of ML Model"
+        )
+        self.ei_threshold_spinbox = QDoubleSpinBox()
+
+        self.ei_threshold_spinbox.setRange(
+            -3.0,
+            3.0
+        )
+
+        self.ei_threshold_spinbox.setValue(
+            0.5
+        )
+
+        self.layout.addWidget(
+            self.ei_threshold_spinbox
+        )
+
+
+        self.use_engagement_index_checkbox.setChecked(False)
+
+        self.layout.addWidget(
+            self.use_engagement_index_checkbox
+        )
+        self.use_EEGMAT_preprocessing_checkbox.setChecked(True)
+
+        self.layout.addWidget(
+            self.use_EEGMAT_preprocessing_checkbox
+        )
+        self.use_engagement_index_checkbox.stateChanged.connect(
+            lambda _: self.update_plot_mode()
+        )
+        self.update_plot_mode()
+
+
+    def preprocess_signal(
+        self,
+        data,
+        sfreq
+    ):
+        if not self.use_EEGMAT_preprocessing_checkbox.isChecked():
+            return data
+
+        data = mne.filter.notch_filter(
+            data,
+            Fs=sfreq,
+            freqs=50,
+
+    method="iir",
+            verbose=False
+        )
+
+        data = mne.filter.filter_data(
+            data,
+            sfreq=sfreq,
+            l_freq=0.5,
+            h_freq=45.0,
+            method='iir',
+            verbose=False
+        )
+
+        return data
+    
     def init_probability_plot(self):
         self.fig = Figure(figsize=(10, 4), facecolor='#121212')
         self.ax = self.fig.subplots()
@@ -226,7 +297,9 @@ class RealTime(QScrollArea):
         
         self.line, = self.ax.plot([], [], color='#4CAF50', linewidth=2, label="Probability (0-100%)")
         self.line_raw, = self.ax2.plot([], [], color='#2196F3', linewidth=2, linestyle='--', label="Raw Output (Logits)")
-        
+        self.line.set_label("Probability")
+        self.line_raw.set_label("Raw Output")
+
         lines_1, labels_1 = self.ax.get_legend_handles_labels()
         lines_2, labels_2 = self.ax2.get_legend_handles_labels()
         self.ax.legend(lines_1 + lines_2, labels_1 + labels_2, loc="upper left", facecolor='#121212', edgecolor='#2d2d2d', labelcolor='white')
@@ -260,6 +333,10 @@ class RealTime(QScrollArea):
                     
                 if os.path.exists(channels_path):
                     self.target_channels = joblib.load(channels_path)
+                    self.target_channels = [
+                        ch.upper()
+                        for ch in self.target_channels
+                    ]
                 else:
                     self.target_channels = None
             else:
@@ -335,7 +412,10 @@ class RealTime(QScrollArea):
         
         if prob_value >= 0.0:
             self.plot_x.append(self.plot_current_time)
-            self.plot_y.append(prob_value * 100.0)
+            if self.use_engagement_index_checkbox.isChecked():
+                self.plot_y.append(prob_value)
+            else:
+                self.plot_y.append(prob_value * 100.0)
             
             if raw_value is not None:
                 self.plot_y_raw.append(raw_value)
@@ -365,30 +445,208 @@ class RealTime(QScrollArea):
             return data * 1e-6
         return data
 
-    def extract_features(self, epoch_data: np.ndarray, sfreq: float) -> np.ndarray:
+    def extract_features(
+        self,
+        epoch_data: np.ndarray,
+        sfreq: float
+    ): 
+
+        def hjorth_parameters(signal):
+            diff1 = np.diff(signal)
+            diff2 = np.diff(diff1)
+
+            activity = np.var(signal)
+
+            mobility = np.sqrt(
+                np.var(diff1) /
+                (activity + 1e-12)
+            )
+
+            complexity = np.sqrt(
+                np.var(diff2) /
+                (np.var(diff1) + 1e-12)
+            ) / (mobility + 1e-12)
+
+            return activity, mobility, complexity
+
+        epoch_data = epoch_data - np.mean(epoch_data, axis=0, keepdims=True)
+            
         n_channels = epoch_data.shape[0]
         nperseg = min(epoch_data.shape[1], int(sfreq * 2))
         freqs, psd = welch(epoch_data, fs=sfreq, nperseg=nperseg, axis=-1)
-        bands = {'delta': (0.5, 4.0), 'theta': (4.0, 8.0), 'alpha': (8.0, 13.0), 'beta': (13.0, 30.0), 'gamma': (30.0, 45.0)}
+        bands = {
+                'delta': (0.5, 4.0),
         
-        features, band_powers = [], {}
+                'theta': (4.0, 8.0),
+        
+                'alpha_low': (8.0, 10.0),
+                'alpha_high': (10.0, 13.0),
+        
+                'beta_low': (13.0, 20.0),
+                'beta_high': (20.0, 30.0),
+        
+                'gamma': (30.0, 45.0)
+            }
+        features = []
+        band_powers = {}
         
         for name, (f_min, f_max) in bands.items():
             mask = (freqs >= f_min) & (freqs <= f_max)
-            p_band = np.trapz(psd[:, mask], freqs[mask], axis=-1) if np.any(mask) else np.zeros(n_channels)
+            p_band = np.trapezoid(psd[:, mask], freqs[mask], axis=-1) if np.any(mask) else np.zeros(n_channels)
             band_powers[name] = p_band
-            features.extend(p_band)
-            features.extend(0.5 * np.log2(2 * np.pi * np.e * (p_band + 1e-12)))
+            # features.extend(p_band)
+            # features.extend(0.5 * np.log2(2 * np.pi * np.e * (p_band + 1e-12)))
+        total_power = (
+                band_powers['delta'] +
+                band_powers['theta'] +
+                band_powers['alpha_low'] +
+                band_powers['alpha_high'] +
+                band_powers['beta_low'] +
+                band_powers['beta_high'] +
+                band_powers['gamma'] +
+                1e-12
+            )
+        features.extend(band_powers['delta'] / total_power)
+
+        features.extend(band_powers['theta'] / total_power)
+
+        features.extend(band_powers['alpha_low'] / total_power)
+        features.extend(band_powers['alpha_high'] / total_power)
+
+        features.extend(band_powers['beta_low'] / total_power)
+        features.extend(band_powers['beta_high'] / total_power)
+
+        features.extend(band_powers['gamma'] / total_power)
+
+
+        features.extend(band_powers['theta'] / (band_powers['beta_low'] + 1e-12))
+        features.extend(band_powers['theta'] / (band_powers['beta_high'] + 1e-12))
+        features.extend(band_powers['alpha_low'] / (band_powers['beta_low'] + 1e-12))
+        features.extend(band_powers['alpha_low'] / (band_powers['beta_high'] + 1e-12))
+        features.extend(band_powers['alpha_high'] / (band_powers['beta_low'] + 1e-12))
+        features.extend(band_powers['alpha_high'] / (band_powers['beta_high'] + 1e-12))
+
+        features.extend((band_powers['beta_high'] + band_powers['beta_low']) / (band_powers['theta'] + band_powers['alpha_low'] + band_powers['alpha_high'] + 1e-12))
+
+        # for ch in range(epoch_data.shape[0]):
+        #     activity, mobility, complexity = hjorth_parameters(epoch_data[ch])
+
+        #     features.extend([
+        #         activity,
+        #         mobility,
+        #         complexity
+        #     ])
+
+        pairs = [
+            ("F3", "F4"),
+            # ("C3", "C4"),
+            # ("P3", "P4"),
+            ('FP1', 'FP2')
+        ]
+        channel_map = {
+            name: idx
+            for idx, name in enumerate(
+                self.target_channels[:len(band_powers["alpha_low"])]
+            )
+        }
+        for left, right in pairs:
+
+            if left not in channel_map:
+                continue
+
+            if right not in channel_map:
+                continue
+
+            l = channel_map[left]
+            r = channel_map[right]
+
             
-        features.extend(band_powers['theta'] / (band_powers['beta'] + 1e-12))
-        features.extend(band_powers['alpha'] / (band_powers['beta'] + 1e-12))
+            asym_low = np.log(band_powers['alpha_low'][r] + 1e-12) - np.log(band_powers['alpha_low'][l] + 1e-12)
+            asym_high = np.log(band_powers['alpha_high'][r] + 1e-12) - np.log(band_powers['alpha_high'][l] + 1e-12)
+
+            features.append(asym_low)
+            features.append(asym_high)
+
         
         return np.array(features)
+
+
+    def calculate_concentration_score(
+    self,
+    epoch_data: np.ndarray,
+    sfreq: float
+    ):
+        epoch_data = epoch_data - np.mean(
+            epoch_data,
+            axis=0,
+            keepdims=True
+        )
+
+        nperseg = min(
+            epoch_data.shape[1],
+            int(sfreq * 2)
+        )
+
+        freqs, psd = welch(
+            epoch_data,
+            fs=sfreq,
+            nperseg=nperseg,
+            axis=-1
+        )
+
+        bands = {
+            'theta': (4.0, 8.0),
+            'alpha_low': (8.0, 10.0),
+            'alpha_high': (10.0, 13.0),
+            'beta_low': (13.0, 20.0),
+            'beta_high': (20.0, 30.0)
+        }
+
+        band_powers = {}
+
+        for name, (f_min, f_max) in bands.items():
+
+            mask = (
+                (freqs >= f_min)
+                &
+                (freqs < f_max)
+            )
+
+            band_powers[name] = np.trapezoid(
+                psd[:, mask],
+                freqs[mask],
+                axis=-1
+            )
+
+        engagement_per_channel = (
+            band_powers["beta_low"]
+            +
+            band_powers["beta_high"]
+        ) / (
+            band_powers["theta"]
+            +
+            band_powers["alpha_low"]
+            +
+            band_powers["alpha_high"]
+            +
+            1e-12
+        )
+
+        return float(
+            np.mean(
+                engagement_per_channel
+            )
+        )
 
     def start_or_stop_acquisition(self):
         if not self.is_running:
             self.is_running = True
             
+            self.engagement_buffer = []
+
+            self.ei_mean = None
+            self.ei_std = None
+
             self.baseline_features_buffer = []
             self.b_mean = None
             self.b_std = None
@@ -412,6 +670,7 @@ class RealTime(QScrollArea):
             
             if self.mock_baseline_path and self.feature_mask is not None:
                 self.precalculate_mock_baseline()
+                print("CALIBRATED:", self.is_calibrated)
             
             if self.is_mock_enabled:
                 raw_test = mne.io.read_raw_edf(self.mock_test_path, preload=False, verbose=False)
@@ -423,7 +682,14 @@ class RealTime(QScrollArea):
                     'FP1': 'Fp1', 'FP2': 'Fp2', 'FZ': 'Fz', 'CZ': 'Cz', 'PZ': 'Pz', 'POZ': 'POz',
                     'T3': 'T7', 'T4': 'T8', 'T5': 'P7', 'T6': 'P8'
                 }
-                self.stream_ch_names = [hardware_mapping.get(ch, ch) for ch in ch_names]
+                self.stream_ch_names = [
+                    hardware_mapping.get(ch.upper(), ch.upper())
+                    for ch in ch_names
+                ]
+                self.stream_ch_names = [
+                    ch.upper()
+                    for ch in self.stream_ch_names
+                ]
                 
                 if self.is_calibrated or self.feature_mask is None:
                     self.queue = [["Mock Task Streaming", 999999.0]]
@@ -438,6 +704,10 @@ class RealTime(QScrollArea):
                     'Fp1', 'Fp2', 'F7', 'F3', 'Fz', 'F4', 'F8', 'FC5', 'FC1', 'FC2', 'FC6',
                     'T7', 'C3', 'Cz', 'C4', 'T8', 'CP5', 'CP1', 'CP2', 'CP6', 'P7', 'P3',
                     'Pz', 'P4', 'P8', 'PO9', 'O1', 'Oz', 'O2', 'PO10', 'AF7', 'AF8'
+                ]
+                self.stream_ch_names = [
+                    ch.upper()
+                    for ch in self.stream_ch_names
                 ]
                 
                 if self.is_calibrated or self.feature_mask is None:
@@ -497,7 +767,13 @@ class RealTime(QScrollArea):
                 'T3': 'T7', 'T4': 'T8', 'T5': 'P7', 'T6': 'P8'
             }
             raw_base.rename_channels({ch: hardware_mapping.get(ch, ch) for ch in raw_base.ch_names})
-            
+            raw_base.rename_channels(
+                {
+                    ch: ch.upper()
+                    for ch in raw_base.ch_names
+                }
+            )
+
             sfreq = raw_base.info['sfreq']
             
             if self.target_channels:
@@ -506,7 +782,6 @@ class RealTime(QScrollArea):
                 raw_base.reorder_channels(avail_ch)  
                 
             data_raw = self.enforce_volts(raw_base.get_data())
-            
             trial_length = 2.0
             required_samples = int(sfreq * trial_length)
             step = int(sfreq * 1.0)
@@ -516,16 +791,71 @@ class RealTime(QScrollArea):
             baseline_feats = []
             for start in range(0, data_raw.shape[1] - required_samples, step):
                 window_raw = data_raw[:, start:start+required_samples]
-                
+                if self.has_artifact(
+                    window_raw,
+                    threshold_uv=150
+                ):
+                    continue
                 if is_feature_based:
                     window_step = window_raw - np.mean(window_raw, axis=0, keepdims=True)
                 else:
                     window_step = window_raw
-                    
-                window_filtered = mne.filter.filter_data(window_step, sfreq=sfreq, l_freq=4.0, h_freq=45.0, method='iir', verbose=False)
-                baseline_feats.append(self.extract_features(window_filtered, sfreq))
                 
+                window_filtered = self.preprocess_signal(
+                    window_step,
+                    sfreq
+                )
+                ei_score = self.calculate_concentration_score(
+                    window_filtered,
+                    sfreq
+                )
+
+                self.engagement_buffer.append(
+                    ei_score
+                )
+                baseline_feats.append(self.extract_features(window_filtered, sfreq))
+                ei_score = self.calculate_concentration_score(
+                    window_filtered,
+                    sfreq
+                )
+
+                self.engagement_buffer.append(
+                    ei_score
+                )
+            if len(self.engagement_buffer):
+
+                self.ei_mean = np.mean(
+                    self.engagement_buffer
+                )
+
+                self.ei_std = (
+                    np.std(
+                        self.engagement_buffer
+                    )
+                    + 1e-12
+                )
+
+                print(
+                    "EI baseline:",
+                    self.ei_mean,
+                    self.ei_std
+                )
+            if len(self.engagement_buffer):
+
+                self.ei_mean = np.mean(
+                    self.engagement_buffer
+                )
+
+                self.ei_std = (
+                    np.std(
+                        self.engagement_buffer
+                    )
+                    + 1e-12
+                )
+            print("baseline_feats:", len(baseline_feats))
             if baseline_feats:
+                
+                print("baseline_feats:", len(baseline_feats))
                 self.b_mean = np.mean(baseline_feats, axis=0)
                 self.b_std = np.std(baseline_feats, axis=0) + 1e-12
                 self.is_calibrated = True
@@ -533,15 +863,86 @@ class RealTime(QScrollArea):
             else:
                 self.status_label.setText("Error: Baseline file too short.")
         except Exception as e:
-            self.status_label.setText(f"Baseline error: {e}")
+            print("BASELINE ERROR:", e)
+            traceback.print_exc()
 
+            self.status_label.setText(
+                f"Baseline error: {e}"
+            )
+    def update_plot_mode(self):
+
+        if self.use_engagement_index_checkbox.isChecked():
+            
+            self.ax.set_title(
+                "Engagement Index",
+                color="white"
+            )
+
+            self.ax.set_ylabel(
+                "EI Score",
+                color="#4CAF50"
+            )
+
+            self.ax2.set_ylabel(
+                "EI Z-Score",
+                color="#2196F3"
+            )
+            self.line.set_label("Engagement Index")
+            self.line_raw.set_label("Z-Score")
+            self.ax.set_ylim(-1, 3)
+
+        else:
+
+            self.ax.set_title(
+                "Probability & Raw Decision Function",
+                color="white"
+            )
+
+            self.ax.set_ylabel(
+                "Probability (%)",
+                color="#4CAF50"
+            )
+
+            self.ax2.set_ylabel(
+                "Raw Logits",
+                color="#2196F3"
+            )
+
+            self.line.set_label("Probability")
+            self.line_raw.set_label("Raw Logits")
+            self.ax.set_ylim(-5, 105)
+
+        legend = self.ax.get_legend()
+        if legend:
+            legend.remove()
+
+        lines_1, labels_1 = self.ax.get_legend_handles_labels()
+        lines_2, labels_2 = self.ax2.get_legend_handles_labels()
+
+        self.ax.legend(
+            lines_1 + lines_2,
+            labels_1 + labels_2,
+            loc="upper left"
+        )
+    
+        self.fig.canvas.draw()
+        self.fig.canvas.flush_events()
+
+    def has_artifact(
+        self,
+        data,
+        threshold_uv=150
+    ):
+        threshold_v = threshold_uv * 1e-6
+
+        return np.max(np.abs(data)) > threshold_v
     def real_time_processor(self, current_signal, current_true_label=None):
+        
         if not self.loaded_pipeline: return "No pipeline loaded"
             
         sampling_rate = self.stream_sfreq
         trial_length = 2.0 
         required_samples = int(sampling_rate * trial_length)
-        
         current_signal = np.array(current_signal)
         if current_signal.shape[1] < required_samples: return "Gathering data..."
             
@@ -557,22 +958,91 @@ class RealTime(QScrollArea):
             process_data_raw = raw_data
 
         process_data_raw = self.enforce_volts(process_data_raw)
-        
+        artifact_threshold = 150e-6
+
+
         is_feature_based = (self.feature_mask is not None)
 
         if is_feature_based:
             process_data_step = process_data_raw - np.mean(process_data_raw, axis=0, keepdims=True)
         else:
             process_data_step = process_data_raw
-            
-        process_data_filt = mne.filter.filter_data(process_data_step, sfreq=sampling_rate, l_freq=4.0, h_freq=45.0, method='iir', verbose=False)
-        
+
+        if self.has_artifact(
+            process_data_raw,
+            threshold_uv=150
+        ):
+            self.prediction_signaler(
+                "Artifact",
+                "Movement / blink detected",
+                -1.0,
+                0.0
+            )
+            return "artifact"
+        process_data_filt = self.preprocess_signal(
+            process_data_step,
+            sampling_rate
+        )     
+
+        if self.use_engagement_index_checkbox.isChecked():
+            score = self.calculate_concentration_score(
+                process_data_filt,
+                sampling_rate
+            )
+
+            if (
+                self.ei_mean is None
+                and
+                len(self.engagement_buffer) > 10
+            ):
+                self.ei_mean = np.mean(
+                    self.engagement_buffer
+                )
+
+                self.ei_std = (
+                    np.std(self.engagement_buffer)
+                    + 1e-12
+                )
+
+            z_score = (
+                score - self.ei_mean
+            ) / self.ei_std
+
+            pred_str = (
+                "Concentration"
+                if z_score > self.ei_threshold_spinbox.value()
+                else "Rest"
+            )
+
+            prob_val = score
+            raw_val = z_score
+
+            prob_str = (
+                f"EI = {score:.3f}\n"
+                f"Z = {z_score:.2f}"
+            )
+
+            self.prediction_signaler(
+                pred_str,
+                prob_str,
+                score,
+                z_score
+            )
+
+            return pred_str
         prob_val = -1.0 
         raw_val = 0.0
 
         label_norm = str(current_true_label).lower() if current_true_label else ""
         
         if "rest" in label_norm or "baseline" in label_norm or "natural" in label_norm:
+            score = self.calculate_concentration_score(
+                process_data_filt,
+                sampling_rate
+            )
+
+            self.engagement_buffer.append(score)
+
             if is_feature_based:
                 raw_features = self.extract_features(process_data_filt, sampling_rate)
                 self.baseline_features_buffer.append(raw_features)
@@ -602,6 +1072,9 @@ class RealTime(QScrollArea):
                     self.is_calibrated = True
 
                 norm_features = (raw_features - self.b_mean) / self.b_std
+                
+                print(len(raw_features))
+                print(np.sum(self.feature_mask))
                 final_features = norm_features[self.feature_mask]
                 X_test = np.expand_dims(final_features, axis=0)
             else:
