@@ -632,7 +632,7 @@ if __name__ == "__main__":
     
     target_channels = [
         'F3', 'F4', 
-        # 'Fz', 'Cz', 'Pz',
+        'Fz', 'Cz', 'Pz',
         'FP1','FP2'
     ]
    
@@ -748,8 +748,7 @@ if __name__ == "__main__":
         X_target_norm = norm_datasets["STRICT BASELINE (Theoretically Perfect)"]["data"]
 
         rfecv_tune = RFECV(
-            estimator=LogisticRegression(
-                max_iter=3000,
+            estimator=LinearSVC(
                 class_weight='balanced',
                 random_state=42
             ),
@@ -783,11 +782,12 @@ if __name__ == "__main__":
 
         print(f"\nFound Best Parameters: {study.best_params}")
 
-        final_prod_model = SVCLogisticRegression(
-                max_iter=3000,
-                class_weight='balanced',
-                random_state=42
-            ),
+        final_prod_model = SVC(
+            kernel="rbf",
+            probability=True,
+            class_weight="balanced",
+            random_state=42
+        )
 
         final_prod_model.fit(
             X_tune_optimal,
