@@ -632,7 +632,7 @@ if __name__ == "__main__":
     
     target_channels = [
         'F3', 'F4', 
-        'Fz', 'Cz', 'Pz',
+        # 'Fz', 'Cz', 'Pz',
         'FP1','FP2'
     ]
    
@@ -640,10 +640,10 @@ if __name__ == "__main__":
     print(sfreq)
     print(X_epochs.shape)
 
-    RUN_ML = False
-    RUN_RIEMANN = False
-    RUN_CSP = False
-    RUN_FINAL_TRAINING = True
+    RUN_ML = True
+    RUN_RIEMANN = True
+    RUN_CSP = True
+    RUN_FINAL_TRAINING = False
     RUN_EEGNET = False
     
     X_features_orig = np.array([
